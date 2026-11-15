@@ -26,6 +26,8 @@
 #include "nptunix/npt_unixlib.h"
 #endif
 
+#include "util/os_time.h"
+
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -39,10 +41,21 @@
 #define FALSE ((BOOL)0)
 #endif
 
+/* A QueryVideoMemoryInfo answer kept until expires_ns (0: none). */
+struct adp3_vidmem_slot {
+   int64_t expires_ns;
+   HRESULT hr;
+   DXGI_QUERY_VIDEO_MEMORY_INFO info;
+};
+
 struct npt_adapter_aux {
    mtx_t lock;
    bool populated;
    struct npt_output_list outputs;
+   /* Node 0's local and non-local segment groups
+    * (adp3_QueryVideoMemoryInfo_override). */
+   SRWLOCK vidmem_lock;
+   struct adp3_vidmem_slot vidmem[2];
 };
 
 static void
@@ -61,6 +74,7 @@ adp_aux_init(struct npt_com_base *com, struct npt_device *dev, uint64_t host_id)
    (void)dev; (void)host_id;
    struct npt_adapter_aux *aux = com->aux;
    mtx_init(&aux->lock, mtx_plain);
+   InitializeSRWLock(&aux->vidmem_lock);
    com->aux_destroy = adp_aux_destroy;
 }
 
@@ -201,6 +215,83 @@ adp3_UnregisterVideoMemoryBudgetChangeNotification_override(void *self,
    (void)self; (void)dwCookie;
 }
 
+/* QueryVideoMemoryInfo is a synchronous round trip to the render server, and
+ * Unreal Engine 5 polls it thousands of times a second from its RHI threads
+ * (about 2,400 calls a second in Bodycam's lobby, 170 us each: 40% of one
+ * thread waiting).  The budget and usage it reports move slowly, so the
+ * adapter keeps one answer per segment group for NPT_VIDMEM_CACHE_NS and
+ * serves it from the guest.  Node 0 only: a multi-adapter caller still asks
+ * the host. */
+#define NPT_VIDMEM_CACHE_NS (100ll * 1000 * 1000)
+
+/* The slot kept for (NodeIndex, group), or NULL when the host answers. */
+static struct adp3_vidmem_slot *
+adp3_vidmem_slot(struct npt_adapter_aux *aux, UINT NodeIndex,
+                 DXGI_MEMORY_SEGMENT_GROUP group)
+{
+   if (!aux || NodeIndex != 0 || (unsigned)group >= ARRAY_SIZE(aux->vidmem))
+      return NULL;
+   return &aux->vidmem[group];
+}
+
+static HRESULT NPT_STDMETHODCALLTYPE
+adp3_QueryVideoMemoryInfo_override(
+   void *self, UINT NodeIndex, DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup,
+   DXGI_QUERY_VIDEO_MEMORY_INFO *pVideoMemoryInfo)
+{
+   struct npt_com_base *adp = self;
+   struct npt_adapter_aux *aux = adp->aux;
+   struct adp3_vidmem_slot *slot =
+      pVideoMemoryInfo ? adp3_vidmem_slot(aux, NodeIndex, MemorySegmentGroup)
+                       : NULL;
+   if (!slot)
+      return npt_idxgiadapter3_default_QueryVideoMemoryInfo(
+         self, NodeIndex, MemorySegmentGroup, pVideoMemoryInfo);
+
+   const int64_t now = os_time_get_nano();
+   HRESULT hr = NPT_S_OK;
+   AcquireSRWLockShared(&aux->vidmem_lock);
+   const bool kept = now < slot->expires_ns;
+   if (kept) {
+      *pVideoMemoryInfo = slot->info;
+      hr = slot->hr;
+   }
+   ReleaseSRWLockShared(&aux->vidmem_lock);
+   if (kept)
+      return hr;
+
+   hr = npt_idxgiadapter3_default_QueryVideoMemoryInfo(
+      self, NodeIndex, MemorySegmentGroup, pVideoMemoryInfo);
+
+   AcquireSRWLockExclusive(&aux->vidmem_lock);
+   slot->hr = hr;
+   slot->info = *pVideoMemoryInfo;
+   slot->expires_ns =
+      NPT_SUCCEEDED(hr) ? os_time_get_nano() + NPT_VIDMEM_CACHE_NS : 0;
+   ReleaseSRWLockExclusive(&aux->vidmem_lock);
+   return hr;
+}
+
+/* A reservation changes the CurrentReservation the next query reports. */
+static HRESULT NPT_STDMETHODCALLTYPE
+adp3_SetVideoMemoryReservation_override(
+   void *self, UINT NodeIndex, DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup,
+   UINT64 Reservation)
+{
+   const HRESULT hr = npt_idxgiadapter3_default_SetVideoMemoryReservation(
+      self, NodeIndex, MemorySegmentGroup, Reservation);
+   struct npt_com_base *adp = self;
+   struct npt_adapter_aux *aux = adp->aux;
+   struct adp3_vidmem_slot *slot =
+      adp3_vidmem_slot(aux, NodeIndex, MemorySegmentGroup);
+   if (slot) {
+      AcquireSRWLockExclusive(&aux->vidmem_lock);
+      slot->expires_ns = 0;
+      ReleaseSRWLockExclusive(&aux->vidmem_lock);
+   }
+   return hr;
+}
+
 #define NPT_REGISTER_OVERRIDE_DXGI_ADAPTER4(m, f) \
    NPT_REGISTER_OVERRIDE(idxgiadapter4, m, f)
 #define NPT_REGISTER_OVERRIDE_DXGI_ADAPTER3(m, f) \
@@ -241,6 +332,10 @@ npt_overrides_dxgi_adapter_init(void)
    NPT_REGISTER_OVERRIDE_DXGI_ADAPTER3(
       UnregisterVideoMemoryBudgetChangeNotification,
       adp3_UnregisterVideoMemoryBudgetChangeNotification_override);
+   NPT_REGISTER_OVERRIDE_DXGI_ADAPTER3(
+      QueryVideoMemoryInfo, adp3_QueryVideoMemoryInfo_override);
+   NPT_REGISTER_OVERRIDE_DXGI_ADAPTER3(
+      SetVideoMemoryReservation, adp3_SetVideoMemoryReservation_override);
 
    npt_com_register_family(adapter_tiers,
                            sizeof(struct npt_adapter_aux),

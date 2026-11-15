@@ -4,6 +4,7 @@
  */
 
 #include "npt_com.h"
+#include "npt_privdata.h"
 #include "npt_device.h"
 #include "npt_dispatch.h"
 #include "npt_env.h"
@@ -425,6 +426,7 @@ npt_com_destroy(struct npt_com_base *com)
       com->base.instance_ring = NULL;
       com->base.private_instance_ring = false;
    }
+   npt_privdata_free(com);
    if (com->aux_destroy)
       com->aux_destroy(com->aux);
    atomic_fetch_sub_explicit(&com->base.priv_ref, 1, memory_order_relaxed);
