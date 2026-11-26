@@ -4,6 +4,7 @@
  */
 
 #include "npt_com.h"
+#include "npt_vr_export.h"
 #include "npt_privdata.h"
 #include "npt_device.h"
 #include "npt_dispatch.h"
@@ -781,6 +782,11 @@ npt_com_query_interface_host(void *self, const GUID *riid, void **ppvObject)
    *ppvObject = NULL;
    if (!riid || !self)
       return NPT_E_POINTER;
+
+   /* steamac/obelisk-vrbridge: DXMT's IMTLD3D11ExportableTexture, answered
+    * in the guest for VR eye textures (npt_vr_export.c). */
+   if (npt_vr_export_query(self, riid, ppvObject))
+      return NPT_S_OK;
 
    /* An interface no ctor wraps cannot be handed out, whatever the host
     * answers. */

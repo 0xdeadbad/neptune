@@ -17,6 +17,7 @@ npt_common_src = files(
   'npt_resource.c',
   'npt_d3d12_heap.c',
   'npt_shared_texture.c',
+  'npt_vr_export.c',
   'npt_swapchain.c',
   'npt_swapchain12.c',
   'npt_swapchain_common.c',
